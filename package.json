@@ -1,15 +1,21 @@
 {
   "name": "avito-webhook-gpt",
   "version": "1.0.0",
-  "description": "Avito webhook handler with Redis chat history",
+  "description": "Avito webhook handler with GPT and Redis support",
   "main": "server.js",
   "type": "module",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "dev": "nodemon server.js"
   },
   "dependencies": {
     "express": "^4.19.2",
-    "body-parser": "^1.20.2",
     "redis": "^4.6.13"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.0"
+  },
+  "engines": {
+    "node": ">=18"
   }
 }

@@ -1,154 +1,147 @@
 // server.js (ESM)
-import express from 'express';
-import crypto from 'crypto';
-import { promises as fsp } from 'fs';
-import path from 'path';
-import { fileURLToPath } from 'url';
+import express from "express";
+import fs from "fs";
+import { promises as fsp } from "fs";
+import path from "path";
+import process from "process";
+import crypto from "crypto";
+import { fileURLToPath } from "url";
+import Redis from "ioredis";
 
+// --- __dirname в ESM ---
 const __filename = fileURLToPath(import.meta.url);
-const __dirname  = path.dirname(__filename);
+const __dirname = path.dirname(__filename);
 
-// ===== ENV / CONFIG =====
-const PORT            = Number(process.env.PORT || 8080);
-const WEBHOOK_SECRET  = process.env.WEBHOOK_SECRET || '';        // должен совпадать с секретом в кабинете Авито
-const LOG_DIR         = process.env.LOG_DIR || '/mnt/data/logs'; // куда писать логи (Railway volume)
-const TASK_DIR        = process.env.TASK_DIR || '/mnt/data/tasks'; // зарезервировано на будущее
-const CLAIM_SCAN_LIMIT= Number(process.env.CLAIM_SCAN_LIMIT || 50);
-const ONLY_FIRST_SYSTEM = String(process.env.ONLY_FIRST_SYSTEM || 'true').toLowerCase() === 'true';
+// --- ENV ---
+const PORT = process.env.PORT || 3000;
+const LOG_DIR = process.env.LOG_DIR || "./logs";
+const TASK_DIR = process.env.TASK_DIR || "./tasks";
+const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || "my_secret_token";
 
-// ===== helpers =====
-async function ensureDir(dir) { try { await fsp.mkdir(dir, { recursive: true }); } catch {} }
-function nowIso(){ return new Date().toISOString(); }
-function logFileName(){ 
-  const d = new Date();
-  const yyyy = d.getUTCFullYear();
-  const mm = String(d.getUTCMonth()+1).padStart(2,'0');
-  const dd = String(d.getUTCDate()).padStart(2,'0');
-  return `logs.${yyyy}${mm}${dd}.log`;
+// Redis
+const REDIS_URL = process.env.REDIS_URL || "";
+const HISTORY_TTL_SEC = Number(process.env.HISTORY_TTL_SEC || 3 * 24 * 60 * 60); // 3 суток
+const HISTORY_LIMIT = Number(process.env.HISTORY_LIMIT || 100);
+
+let redis = null;
+if (REDIS_URL) {
+  redis = new Redis(REDIS_URL);
+  redis.on("error", (e) => console.error("[REDIS] error:", e.message));
 }
-async function appendLog(lines){
-  await ensureDir(LOG_DIR);
-  const file = path.join(LOG_DIR, logFileName());
-  const txt  = (Array.isArray(lines)?lines:[lines]).join('') + '\n';
-  await fsp.appendFile(file, txt, 'utf8');
-}
+const histKey = (account, chatId) => `chat:${account}:${chatId}`;
 
-// Сохраняем raw body, чтобы уметь проверять HMAC, если Авито пришлёт подпись
-const app = express();
-app.use(express.json({
-  verify: (req, _res, buf) => { req.rawBody = buf; }
-}));
+async function saveToHistory({ account, value }) {
+  if (!redis) return;
+  if (!value?.chat_id) return;
 
-// ===== Проверка секрета =====
-function checkAvitoSecret(req){
-  if (!WEBHOOK_SECRET) return { ok: true, mode: 'open' };
+  const text = String(value?.content?.text || "");
+  if (/Системное сообщение/i.test(text)) return; // пропускаем системные
 
-  // 1) Прямой заголовок
-  const plain = req.headers['x-avito-secret'];
-  if (plain && String(plain) === WEBHOOK_SECRET)
-    return { ok: true, mode: 'header' };
-
-  // 2) HMAC-подпись (если вдруг используется)
-  const sig = req.headers['x-avito-messenger-signature'];
-  if (sig && req.rawBody && Buffer.isBuffer(req.rawBody)) {
-    const calc = crypto.createHmac('sha256', WEBHOOK_SECRET)
-                       .update(req.rawBody)
-                       .digest('hex');
-    if (String(sig).toLowerCase() === calc.toLowerCase())
-      return { ok: true, mode: 'hmac' };
-  }
-
-  return { ok: false, why: { providedHeader: plain ?? null, hasHmac: Boolean(sig) } };
-}
-
-// ===== Единая обработка для нескольких аккаунтов =====
-function webhookHandler(account){
-  return async (req, res) => {
-    const sec = checkAvitoSecret(req);
-    if (!sec.ok) {
-      await appendLog(`[WEBHOOK] Forbidden (${account}): секрет не совпадает ${JSON.stringify(sec.why)}`);
-      return res.status(403).json({ ok:false, error:'forbidden' });
-    }
-
-    // Лог красиво
-    const stamp = nowIso();
-    const headerDump = {
-      host: req.headers.host,
-      'user-agent': req.headers['user-agent'],
-      'content-length': req.headers['content-length'],
-      'content-type': req.headers['content-type'],
-      'x-avito-messenger-signature': req.headers['x-avito-messenger-signature'],
-      'x-avito-secret': req.headers['x-avito-secret'] ? '<set>' : undefined,
-      'x-forwarded-for': req.headers['x-forwarded-for'],
-      'x-railway-edge': req.headers['x-railway-edge'],
-      'x-railway-request-id': req.headers['x-railway-request-id'],
-    };
-
-    await appendLog(
-`=== RAW AVITO WEBHOOK (${account}) @ ${stamp} ===
--- HEADERS --
-${JSON.stringify(headerDump, null, 2)}
--- BODY --
-${JSON.stringify(req.body || {}, null, 2)}
-=========================`
-    );
-
-    // здесь можно поставить задачу в очередь (если нужно), сейчас просто 200
-    return res.json({ ok:true });
+  const item = {
+    ts: value?.created ?? Math.floor(Date.now() / 1000),
+    iso: new Date().toISOString(),
+    type: value?.type ?? null,
+    author_id: value?.author_id ?? null,
+    text,
+    message_id: value?.id ?? null,
+    item_id: value?.item_id ?? null,
   };
+
+  const key = histKey(account, value.chat_id);
+  await redis
+    .multi()
+    .lpush(key, JSON.stringify(item))
+    .ltrim(key, 0, HISTORY_LIMIT - 1)
+    .expire(key, HISTORY_TTL_SEC)
+    .exec();
 }
 
-// Роуты вебхуков
-app.post('/webhook/hr-gpt',       webhookHandler('hr-gpt'));
-app.post('/webhook/personalpro',  webhookHandler('personalpro'));
-
-// ===== Служебные роуты для проверки =====
-app.get('/', (_req, res) => {
-  res.json({
-    ok: true,
-    up: true,
-    port: PORT,
-    LOG_DIR,
-    TASK_DIR,
-    secretSet: Boolean(WEBHOOK_SECRET),
-  });
-});
-
-// Список лог-файлов
-app.get('/logs', async (_req, res) => {
+// --- HELPERS ---
+async function ensureDir(d) {
   try {
-    await ensureDir(LOG_DIR);
-    const files = await fsp.readdir(LOG_DIR);
-    const stats = await Promise.all(files.map(async name => {
-      const st = await fsp.stat(path.join(LOG_DIR, name));
-      return { name, mtime: st.mtimeMs };
-    }));
-    res.json({ ok:true, files: stats.sort((a,b)=>b.mtime-a.mtime) });
-  } catch (e) {
-    res.status(500).json({ ok:false, error: String(e) });
+    await fsp.mkdir(d, { recursive: true });
+  } catch {}
+}
+function nowIso() {
+  return new Date().toISOString();
+}
+function genId() {
+  return crypto.randomBytes(8).toString("hex");
+}
+
+// --- LOG ---
+async function appendLog(text) {
+  await ensureDir(LOG_DIR);
+  const file = path.join(LOG_DIR, `logs.${new Date().toISOString().slice(0, 10)}.log`);
+  await fsp.appendFile(file, text + "\n", "utf8");
+  console.log(text);
+}
+
+// --- TASKS ---
+async function createTask({ account, chat_id, reply_text }) {
+  await ensureDir(TASK_DIR);
+  const id = genId();
+  const task = {
+    id,
+    account,
+    chat_id,
+    reply_text: reply_text || "Здравствуйте!",
+    created_at: nowIso(),
+  };
+  const file = path.join(TASK_DIR, `${account}__${id}.json`);
+  await fsp.writeFile(file, JSON.stringify(task, null, 2), "utf8");
+  return task;
+}
+
+// --- APP ---
+const app = express();
+app.use(express.json({ limit: "1mb" }));
+
+app.get("/", (req, res) => res.json({ ok: true, redis: Boolean(redis) }));
+
+// Avito Webhook
+app.post("/webhook/:account", async (req, res) => {
+  const account = req.params.account;
+
+  if (WEBHOOK_SECRET) {
+    const secret = req.headers["x-avito-secret"];
+    if (secret !== WEBHOOK_SECRET) return res.status(403).json({ ok: false, error: "forbidden" });
   }
-});
 
-// Прочитать кусок лога
-app.get('/logs/read', async (req, res) => {
-  try {
-    const file = String(req.query.file || '');
-    const tail = Number(req.query.tail || 4000);
-    if (!file) return res.status(400).json({ ok:false, error:'file required' });
-    const full = path.join(LOG_DIR, file);
-    const data = await fsp.readFile(full, 'utf8');
-    const out = tail > 0 && data.length > tail ? data.slice(-tail) : data;
-    res.type('text/plain').send(out);
-  } catch (e) {
-    res.status(500).json({ ok:false, error: String(e) });
+  const pretty = JSON.stringify(req.body || {}, null, 2);
+  await appendLog(`=== RAW AVITO WEBHOOK (${account}) @ ${nowIso()} ===\n${pretty}\n=========================`);
+
+  const val = req.body?.payload?.value;
+  if (val) {
+    // сохраняем историю (кроме "Системное сообщение")
+    await saveToHistory({ account, value: val });
+
+    // ставим задачу, если "Кандидат откликнулся"
+    const txt = String(val?.content?.text || "");
+    if (/Кандидат откликнулся/i.test(txt)) {
+      await createTask({ account, chat_id: val.chat_id, reply_text: "Здравствуйте!" });
+    }
   }
+
+  res.json({ ok: true });
 });
 
-// ===== START =====
-await ensureDir(LOG_DIR);
-await ensureDir(TASK_DIR);
-
-app.listen(PORT, () => {
-  console.log(`✅ Webhook server running on port ${PORT}`);
-  console.log(`LOG_DIR=${LOG_DIR}, TASK_DIR=${TASK_DIR}, SECRET=${WEBHOOK_SECRET ? '<set>' : '<empty>'}`);
+// Debug endpoints
+app.get("/logs", async (req, res) => {
+  await ensureDir(LOG_DIR);
+  const files = await fsp.readdir(LOG_DIR);
+  res.json({ ok: true, files });
 });
+
+app.get("/tasks/debug", async (req, res) => {
+  await ensureDir(TASK_DIR);
+  const files = await fsp.readdir(TASK_DIR);
+  res.json({ ok: true, files });
+});
+
+// --- START ---
+(async () => {
+  await ensureDir(LOG_DIR);
+  await ensureDir(TASK_DIR);
+  app.listen(PORT, () => console.log("Server on port", PORT));
+})();

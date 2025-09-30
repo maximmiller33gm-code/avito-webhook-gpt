@@ -104,9 +104,19 @@ app.post("/webhook/:account", async (req, res) => {
   const account = req.params.account;
 
   if (WEBHOOK_SECRET) {
-    const secret = req.headers["x-avito-secret"];
-    if (secret !== WEBHOOK_SECRET) return res.status(403).json({ ok: false, error: "forbidden" });
+  const provided =
+    req.headers["x-avito-secret"] ??
+    req.headers["x-avito-messenger-signature"]; // если вдруг Авито шлёт подпись
+
+  if (provided !== WEBHOOK_SECRET) {
+    console.warn("[WEBHOOK] Forbidden: секрет не совпадает", {
+      providedLen: provided ? String(provided).length : 0,
+      expectedLen: WEBHOOK_SECRET.length,
+      headerKeys: Object.keys(req.headers).filter(k => k.includes("avito")),
+    });
+    return res.status(403).json({ ok: false, error: "forbidden" });
   }
+}
 
   const pretty = JSON.stringify(req.body || {}, null, 2);
   await appendLog(`=== RAW AVITO WEBHOOK (${account}) @ ${nowIso()} ===\n${pretty}\n=========================`);

@@ -233,9 +233,9 @@ app.post("/webhook/:account", async (req, res) => {
   const isSystem = (val.type || "").toLowerCase() === "system" || txt.startsWith("[Системное сообщение]");
   const isApply = isSystem && /Кандидат\s+откликнулся/i.test(txt);
 
-  // Сохраняем только НЕ системные сообщения
-if (chatId && msgId && txt && !txt.startsWith("[Системное сообщение]")) {
-  await redis.lPush(`chat:${account}:${chatId}`, JSON.stringify({
+  // Сохраняем событие в историю, кроме системных сообщений
+if (chatId && msgId && txt && !txt.includes("[Системное сообщение]")) {
+  const entry = {
     chat_id: chatId,
     ts: val.created,
     type: val.type,
@@ -243,7 +243,13 @@ if (chatId && msgId && txt && !txt.startsWith("[Системное сообще�
     item_id: val.item_id,
     message_id: msgId,
     author_id: val.author_id,
-  }));
+  };
+
+  const key = `chat:${account}:${chatId}`;
+  await redis.lPush(key, JSON.stringify(entry));
+  await redis.lTrim(key, 0, limit - 1); // оставляем только HISTORY_LIMIT сообщений
+  await redis.expire(key, ttl); // TTL из HISTORY_TTL_SEC
+}
 
   // Ограничиваем длину истории
   const limit = Number(process.env.HISTORY_LIMIT || 100);

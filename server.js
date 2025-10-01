@@ -225,6 +225,46 @@ app.post("/webhook/:account", async (req, res) => {
   res.json({ ok: true });
 });
 
+// === Просмотр истории в браузере ===
+
+// Список чатов для аккаунта (удобно найти нужный chat_id)
+app.get("/history/:account", async (req, res) => {
+  try {
+    const { account } = req.params;
+    const prefix = `chat:${account}:*`;
+
+    // Собираем все ключи chat:<account>:<chat_id>
+    const chats = [];
+    for await (const key of redis.scanIterator({ MATCH: prefix, COUNT: 500 })) {
+      const chat_id = key.split(":").pop();
+      chats.push({ chat_id, key });
+    }
+
+    res.json({ ok: true, account, count: chats.length, chats });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e.message || e) });
+  }
+});
+
+// История конкретного чата
+app.get("/history/:account/:chat_id", async (req, res) => {
+  try {
+    const { account, chat_id } = req.params;
+    const key = `chat:${account}:${chat_id}`;        // тот же ключ, куда мы писали историю
+    const limit = Math.max(1, Math.min(500, Number(req.query.n || 100)));
+
+    // Историю мы сохраняли LPUSH, поэтому читаем LRange от 0 до limit-1 и разворачиваем по времени
+    const raw = await redis.lRange(key, 0, limit - 1);    // самые новые в начале
+    const history = raw.map(s => {
+      try { return JSON.parse(s); } catch { return { raw: s }; }
+    }).sort((a, b) => (a.ts || 0) - (b.ts || 0));         // по возрастанию времени
+
+    res.json({ ok: true, key, count: history.length, history });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e.message || e) });
+  }
+});
+
 // === start ===
 app.listen(PORT, () => {
   console.log("App root:", process.cwd());

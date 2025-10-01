@@ -233,7 +233,7 @@ app.post("/webhook/:account", async (req, res) => {
   const isSystem = (val.type || "").toLowerCase() === "system" || txt.startsWith("[Системное сообщение]");
   const isApply = isSystem && /Кандидат\s+откликнулся/i.test(txt);
 
-  // === 3.5 Сохраняем событие в историю (кроме системных) ===
+// === 3.5 Сохраняем событие в историю (кроме системных) ===
 const limit = Number(process.env.HISTORY_LIMIT || 100);
 const ttl   = Number(process.env.HISTORY_TTL_SEC || 259200);
 
@@ -249,26 +249,10 @@ if (chatId && msgId && txt && !txt.includes("[Системное сообщен�
   };
 
   const key = `chat:${account}:${chatId}`;
-  await redis.lPush(key, JSON.stringify(entry)); // добавили запись
-  await redis.lTrim(key, 0, limit - 1);          // держим не более limit
-  await redis.expire(key, ttl);                  // TTL на ключ
+  await redis.lPush(key, JSON.stringify(entry));
+  await redis.lTrim(key, 0, limit - 1);
+  await redis.expire(key, ttl);
 }
-
-  // Ограничиваем длину истории
-  const limit = Number(process.env.HISTORY_LIMIT || 100);
-  await redis.lTrim(`chat:${account}:${chatId}`, 0, limit - 1);
-}
-
-  // Сохраняем событие в историю (Redis)
-await saveToHistory(account, {
-  chat_id:   chatId,
-  ts:        Number(val.created || Date.now()),
-  type:      isSystem ? "system" : "text",
-  text:      txt,
-  item_id:   val.item_id || "",
-  message_id: msgId || "",
-  author_id:  val.author_id || "",
-});
 
   // 4) Правило создания задач:
   //    - если системное и «Кандидат откликнулся…» → создать

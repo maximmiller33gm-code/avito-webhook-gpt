@@ -3,6 +3,16 @@ import fs from "fs";
 import path from "path";
 import crypto from "crypto";
 
+import { createClient } from "redis";
+
+// === Redis client ===
+const redis = createClient({ url: process.env.REDIS_URL });
+
+redis.on("error", (err) => console.error("Redis Client Error", err));
+
+// подключаемся к Redis (async/await нужно обернуть в IIFE или сделать top-level await)
+await redis.connect();
+
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 

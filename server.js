@@ -159,17 +159,7 @@ app.post("/tasks/done", async (req, res) => {
 
 // === WEBHOOK: принимает любые имена /webhook/:account ===
 app.post("/webhook/:account", async (req, res) => {
-  const account = req.params.account;
-
-  // Если включен DEBUG_WEBHOOK → печатаем тело запроса
-  if (DEBUG_WEBHOOK) {
-    logBodyToStdout(account, req.body);
-  }
-
-  const val = req.body?.payload?.value || {};
-  const chatId = val.chat_id || "";
-  const msgId = val.id || "";
-  const txt = (val.content?.text || "").trim();
+  const account = String(req.params.account || "").trim();
 
   // 1) Секрет (если указан в ENV)
   const providedSecret = req.headers["x-avito-secret"];

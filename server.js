@@ -232,6 +232,7 @@ app.post("/webhook/:account", async (req, res) => {
   const txt = (val.content?.text || "").trim();
   const isSystem = (val.type || "").toLowerCase() === "system" || txt.startsWith("[Системное сообщение]");
   const isApply = isSystem && /Кандидат\s+откликнулся/i.test(txt);
+  const authorId = val.author_id || "";
 
   // Твой id аккаунта (или по-аккаунтно из карты)
 const MY_ACCOUNT_ID = String(process.env.ACCOUNT_ID || process.env.ACCOUNTID || "");

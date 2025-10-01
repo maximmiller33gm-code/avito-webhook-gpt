@@ -32,6 +32,8 @@ const TASK_DIR = process.env.TASK_DIR || "/mnt/data/tasks";
 const TASK_KEY = process.env.TASK_KEY || "kK9f4JQ7uX2pL0aN";
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || "";  // если пусто — секрет не проверяем
 const MAX_CLAIM_SCAN = Number(process.env.CLAIM_SCAN_LIMIT || 50);
+const HISTORY_LIMIT   = Number(process.env.HISTORY_LIMIT   || 100);
+const HISTORY_TTL_SEC = Number(process.env.HISTORY_TTL_SEC || 259200); // 3 дня
 
 // Включаем печать тела запроса в Deploy Logs по флагу
 const DEBUG_WEBHOOK = String(process.env.DEBUG_WEBHOOK || "").toLowerCase() === "true";
@@ -54,6 +56,18 @@ for (const p of [LOG_DIR, TASK_DIR]) {
 }
 
 // === helpers ===
+const saveToHistory = async (account, entry) => {
+  const key = `chat:${account}:${entry.chat_id}`;
+  const payload = JSON.stringify(entry);
+
+  await redis.lPush(key, payload);                 // кладём сверху
+  await redis.lTrim(key, 0, HISTORY_LIMIT - 1);    // обрезаем список
+  if (HISTORY_TTL_SEC > 0) await redis.expire(key, HISTORY_TTL_SEC);
+
+  // чтобы было видно в Deploy Logs:
+  await appendLog(`[HIST] saved ${account} chat=${entry.chat_id} msg=${entry.message_id || ""}`);
+};
+
 const nowIso = () => new Date().toISOString();
 const logFileName = () => `logs.${new Date().toISOString().slice(0,10).replace(/-/g,"")}.log`;
 const appendLog = async (line) => {
@@ -218,6 +232,17 @@ app.post("/webhook/:account", async (req, res) => {
   const txt = (val.content?.text || "").trim();
   const isSystem = (val.type || "").toLowerCase() === "system" || txt.startsWith("[Системное сообщение]");
   const isApply = isSystem && /Кандидат\s+откликнулся/i.test(txt);
+
+  // Сохраняем событие в историю (Redis)
+await saveToHistory(account, {
+  chat_id:   chatId,
+  ts:        Number(val.created || Date.now()),
+  type:      isSystem ? "system" : "text",
+  text:      txt,
+  item_id:   val.item_id || "",
+  message_id: msgId || "",
+  author_id:  val.author_id || "",
+});
 
   // 4) Правило создания задач:
   //    - если системное и «Кандидат откликнулся…» → создать

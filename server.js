@@ -17,7 +17,7 @@ const TASK_KEY          = process.env.TASK_KEY || 'kK9f4JQ7uX2pL0aN';
 const LOG_DIR           = process.env.LOG_DIR  || path.join(__dirname, 'logs');
 const TASK_DIR          = process.env.TASK_DIR || path.join(__dirname, 'tasks');
 const DEFAULT_REPLY     = process.env.DEFAULT_REPLY || 'Здравствуйте!';
-const WEBHOOK_SECRET    = process.env.WEBHOOK_SECRET || '';  // если пусто — не проверяем
+const WEBHOOK_SECRET    = process.env.WEBHOOK_SECRET || '123';  // если пусто — не проверяем
 const ONLY_FIRST_SYSTEM = String(process.env.ONLY_FIRST_SYSTEM || 'true').toLowerCase() === 'true';
 const MAX_CLAIM_SCAN    = Number(process.env.MAX_CLAIM_SCAN || 50); // сколько файлов смотреть в claim
 

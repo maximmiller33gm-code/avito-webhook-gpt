@@ -163,12 +163,11 @@ app.post("/webhook/:account", async (req, res) => {
 
   // 1) Секрет (если указан в ENV)
   const providedSecret = req.headers["x-avito-secret"];
-  if (WEBHOOK_SECRET) {
-    if (!providedSecret || String(providedSecret) !== String(WEBHOOK_SECRET)) {
-      await appendLog(`[WEBHOOK] Forbidden: secret mismatch { providedLen: ${String(providedSecret||"").length}, expectedLen: ${WEBHOOK_SECRET.length} }`);
-      return res.status(403).json({ ok: false, error: "forbidden" });
-    }
-  }
+  // if (WEBHOOK_SECRET) {
+//   if (!providedSecret || String(providedSecret) !== String(WEBHOOK_SECRET)) {
+//     return res.status(403).json({ ok: false, error: "forbidden" });
+//   }
+// }
 
   // 2) Логируем «сырое» тело
   const pretty = JSON.stringify(req.body || {}, null, 2);

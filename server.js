@@ -263,18 +263,26 @@ if (chatId && msgId && txt && !txt.includes("[Системное сообщен�
   else if (!isSystem && txt) shouldCreate = true;
 
   if (shouldCreate && chatId) {
-    const replyDefault = process.env.DEFAULT_REPLY || "Здравствуйте!";
-    await writeTask({
-      account,
-      chat_id: chatId,
-      reply_text: replyDefault,
-      message_id: msgId,
-      created_at: nowIso()
-    });
-    await appendLog(`[TASK] created for ${account} chat=${chatId} msg=${msgId}`);
-  } else {
-    await appendLog(`[TASK] skipped for ${account} chat=${chatId} reason=${isSystem ? "system-non-apply" : "no-text"}`);
-  }
+  // Берём текст из сообщения, а не дефолт
+  // - если обычный текст → пишем его
+  // - если системный отклик → оставляем пусто (или поставь свою фразу)
+  // - если вообще нет текста → тоже пусто
+  const replyText =
+    (!isSystem && txt) ? String(txt) :
+    (isApply ? "" : "");
+
+  await writeTask({
+    account,
+    chat_id: chatId,
+    reply_text: replyText,   // <-- здесь теперь реальный текст/пусто
+    message_id: msgId,
+    created_at: nowIso(),
+  });
+
+  await appendLog(`[TASK] created for ${account} chat=${chatId} msg=${msgId} reply="${replyText.slice(0,80)}"`);
+} else {
+  await appendLog(`[TASK] skipped for ${account} chat=${chatId} reason=${isSystem ? "system-non-apply" : "no-text"}`);
+}
 
   res.json({ ok: true });
 });

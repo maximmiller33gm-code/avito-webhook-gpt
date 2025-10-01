@@ -1,342 +1,240 @@
-// server.js
-import express from "express";
-import fs from "fs";
-import path from "path";
-import crypto from "crypto";
-import { fileURLToPath } from "url";
-import { createClient } from "redis";
+@@ -1,29 +1,42 @@
+// server.js — простая очередь задач под вебхуки Авито (CJS)
+// server.js — Avito webhook + file queue + (опц.) Redis history (ESM)
 
+const express = require('express');
+const fs = require('fs');
+const fsp = fs.promises;
+const path = require('path');
+const crypto = require('crypto');
+import express from 'express';
+import fs from 'fs';
+import { promises as fsp } from 'fs';
+import path from 'path';
+import crypto from 'crypto';
+import { fileURLToPath } from 'url';
+
+// ===== ESM __dirname/filename =====
 const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+const __dirname  = path.dirname(__filename);
 
-const app = express();
-app.use(express.json({ limit: "1mb" }));
+// ===== CONFIG =====
+const PORT = Number(process.env.PORT || 8080);
 
-// ==== ENV ====
-const PORT              = Number(process.env.PORT || 8080);
-const LOG_DIR           = process.env.LOG_DIR || path.join(__dirname, "data", "logs");
-const TASK_DIR          = process.env.TASK_DIR || path.join(__dirname, "data", "tasks");
-const WEBHOOK_SECRET    = process.env.WEBHOOK_SECRET || ""; // "123" и т.п.
-const TASK_KEY          = process.env.TASK_KEY || "kK9f4JQ7uX2pL0aN";
-const CLAIM_SCAN_LIMIT  = Number(process.env.CLAIM_SCAN_LIMIT || 50);
-const DEFAULT_REPLY     = process.env.DEFAULT_REPLY || "Здравствуйте!";
-const ONLY_FIRST_SYSTEM = /^(true|1)$/i.test(process.env.ONLY_FIRST_SYSTEM || "false"); // если true — на системные «Кандидат откликнулся…» реагируем 1 раз на чат
+// Куда складывать логи и задачи
+const LOG_DIR  = process.env.LOG_DIR  || '/mnt/data/logs';
+const TASK_DIR = process.env.TASK_DIR || '/mnt/data/tasks';
 
-// Redis
-const REDIS_URL        = process.env.REDIS_URL || "";
-const HISTORY_LIMIT    = Number(process.env.HISTORY_LIMIT || 100);  // сколько сообщений держать
-const HISTORY_TTL_SEC  = Number(process.env.HISTORY_TTL_SEC || 3 * 24 * 3600); // 3 суток
+// Ключ для claim/done/requeue
+const TASK_KEY = process.env.TASK_KEY || 'kK9f4JQ7uX2pL0aN';
 
-let redis = null;
+// Текст автоответа по умолчанию
+const DEFAULT_REPLY = process.env.DEFAULT_REPLY || 'Здравствуйте!';
+
+// Брать только первое системное сообщение по чату (антидубль за сессию)
+const ONLY_FIRST_SYSTEM = String(process.env.ONLY_FIRST_SYSTEM || 'true').toLowerCase() === 'true';
+
+// Сколько последних файлов смотреть при claim (увеличено, чтобы ничего не «терялось»)
+const CLAIM_WINDOW = Number(process.env.CLAIM_WINDOW || 50);
+const CLAIM_WINDOW = Number(process.env.CLAIM_WINDOW || 50); // смотрим до 50 файлов при claim
+
+// ===== (optional) Redis for history =====
+let redisClient = null;
+const REDIS_URL = process.env.REDIS_URL || '';
 if (REDIS_URL) {
-  redis = createClient({ url: REDIS_URL });
-  redis.on("error", (e) => console.error("[REDIS] error:", e));
-  await redis.connect();
+  // импортируем динамически чтобы не падать, если пакета нет
+  const { createClient } = await import('redis');
+  redisClient = createClient({ url: REDIS_URL });
+  redisClient.on('error', (e) => console.error('[Redis] error:', e));
+  try {
+    await redisClient.connect();
+    console.log('[Redis] connected');
+  } catch (e) {
+    console.error('[Redis] connect failed:', e);
+    redisClient = null;
+  }
 }
 
-// ==== FS utils ====
-function nowIso() { return new Date().toISOString(); }
-function ymd() { return new Date().toISOString().slice(0,10).replace(/-/g, ""); }
-
-function ensureDir(d) { fs.mkdirSync(d, { recursive: true }); }
-
-function logFilePath() {
-  ensureDir(LOG_DIR);
-  return path.join(LOG_DIR, `logs.${new Date().toISOString().slice(0,10)}.log`);
+// ===== HELPERS =====
+async function ensureDir(dir) { try { await fsp.mkdir(dir, { recursive: true }); } catch {} }
+@@ -33,7 +46,7 @@ function genId() { return crypto.randomBytes(16).toString('hex'); }
+function todayLogName() {
+  const d = new Date();
+  const y = d.getUTCFullYear();
+  const m = String(d.getUTCMonth()+1).padStart(2, '0');
+  const m = String(d.getUTCMonth() + 1).padStart(2, '0');
+  const dd = String(d.getUTCDate()).padStart(2, '0');
+  return `logs.${y}${m}${dd}.log`;
 }
-function appendLog(line) {
-  fs.appendFileSync(logFilePath(), line + "\n", "utf8");
-}
-
-// history helpers
-function histKey(account, chat) {
-  return `hist:${account}:${chat}`;
-}
-async function saveToHistory({ account, value }) {
-  // не сохраняем «Системное сообщение»
-  const txt = String(value?.content?.text || "");
-  const isSystem = /\[Системное сообщение\]/i.test(txt) || String(value?.type || "") === "system";
-  if (isSystem) return;
-
-  if (!redis) return;
-  const chat_id = value?.chat_id;
-  if (!chat_id) return;
-
-  const record = {
-    ts: Date.now(),
-    author_id: value?.author_id ?? null,
-    type: value?.type ?? null,
-    text: txt,
-    item_id: value?.item_id ?? null,
-  };
-
-  const key = histKey(account, chat_id);
-  await redis.rPush(key, JSON.stringify(record));
-  await redis.lTrim(key, -HISTORY_LIMIT, -1);
-  await redis.expire(key, HISTORY_TTL_SEC);
-}
-
-// create task
-function taskFileName(account, id) {
-  return `${account}__${id}.json`;
-}
-function taskLockName(name) {
-  return `${name}.taking`;
-}
-async function createTask({ account, chat_id, reply_text, message_id, item_id }) {
-  ensureDir(TASK_DIR);
-  const id = crypto.createHash("md5")
-    .update(`${account}:${chat_id}:${message_id || ""}:${Date.now()}`)
-    .digest("hex");
-
-  const file = taskFileName(account, id);
-  const p = path.join(TASK_DIR, file);
-  const payload = {
-    id,
-    account,
-    chat_id,
-    reply_text: reply_text || DEFAULT_REPLY,
-    message_id: message_id || "",
-    item_id: item_id || "",
-    created_at: nowIso(),
-  };
-  fs.writeFileSync(p, JSON.stringify(payload, null, 2), "utf8");
-  appendLog(`[TASK] created ${file} chat=${chat_id}`);
+@@ -46,9 +59,8 @@ async function appendLog(text) {
   return file;
 }
 
-// ==== Security helpers (secret check) ====
-function safeEq(a, b) {
-  const A = Buffer.from(String(a), "utf8");
-  const B = Buffer.from(String(b), "utf8");
-  if (A.length !== B.length) return false;
-  return crypto.timingSafeEqual(A, B);
-}
-function hmacHex(secret, bodyStr) {
-  return crypto.createHmac("sha256", secret).update(bodyStr).digest("hex");
-}
-function checkSecret(req) {
-  // Если секрета нет — принимаем всё (стенд)
-  if (!WEBHOOK_SECRET) return true;
+// ===== TASK QUEUE (file-based) =====
+// Формат файла задачи: { id, account, chat_id, reply_text, message_id, created_at }
 
-  const raw = JSON.stringify(req.body || {});
-  const s1 = req.headers["x-avito-secret"];
-  if (s1 && safeEq(String(s1), WEBHOOK_SECRET)) return true;
+// ===== FILE QUEUE =====
+// task file: { id, account, chat_id, reply_text, message_id, created_at }
+async function createTask({ account, chat_id, reply_text, message_id }) {
+  await ensureDir(TASK_DIR);
+  const id  = genId();
+@@ -72,20 +84,17 @@ async function claimTask(account) {
+  await ensureDir(TASK_DIR);
+  let files = (await fsp.readdir(TASK_DIR)).filter(f => f.endsWith('.json'));
 
-  const sig = req.headers["x-avito-messenger-signature"];
-  if (sig && safeEq(String(sig), hmacHex(WEBHOOK_SECRET, raw))) return true;
+  // фильтр по аккаунту
+  if (account) {
+    const pref = `${account}__`;
+    files = files.filter(f => f.startsWith(pref));
+  }
 
-  appendLog(`[WEBHOOK] Forbidden: secret mismatch { providedLen: ${String(s1||sig||"").length}, expectedLen: ${WEBHOOK_SECRET.length}, headerKeys: ${JSON.stringify(Object.keys(req.headers).filter(k=>k.startsWith("x-")))} }`);
-  return false;
-}
+  // сортировка новые → старые по mtime
+  files.sort((a, b) => {
+    const ta = fs.statSync(path.join(TASK_DIR, a)).mtimeMs;
+    const tb = fs.statSync(path.join(TASK_DIR, b)).mtimeMs;
+    return tb - ta;
+  });
 
-// ==== Routes ====
+  // окно просмотра
+  files = files.slice(0, CLAIM_WINDOW);
+
+  for (const f of files) {
+@@ -97,7 +106,7 @@ async function claimTask(account) {
+      const lockId = path.basename(taking);
+      return { task: raw, lockId };
+    } catch {
+      // параллельный захват — пробуем следующий
+      // файл уже взяли параллельно — продолжаем
+    }
+  }
+  return null;
+@@ -120,13 +129,13 @@ async function requeueTask(lockId) {
+const app = express();
+app.use(express.json({ limit: '1mb' }));
+
+function ok(res, extra = {}) { return res.json({ ok: true, ...extra }); }
+function bad(res, code, msg) { return res.status(code).json({ ok: false, error: msg }); }
+const ok  = (res, extra = {}) => res.json({ ok: true, ...extra });
+const bad = (res, code, msg)  => res.status(code).json({ ok: false, error: msg });
 
 // health
-app.get("/", (req, res) => res.json({ ok: true, redis: Boolean(redis) }));
+app.get('/', (_req, res) => ok(res, { up: true }));
 
-// history read
-app.get("/history/:account/:chat", async (req, res) => {
-  if (!redis) return res.json({ ok: false, error: "no redis" });
-  const { account, chat } = req.params;
-  const key = histKey(account, chat);
-  const arr = await redis.lRange(key, 0, -1);
-  const out = arr.map(s => { try { return JSON.parse(s); } catch { return null; } }).filter(Boolean);
-  res.json({ ok: true, count: out.length, history: out });
+// ===== LOGS API (диагностика) =====
+// ===== LOGS DEBUG =====
+app.get('/logs', async (_req, res) => {
+  try {
+    await ensureDir(LOG_DIR);
+@@ -146,7 +155,7 @@ app.get('/logs/read', async (req, res) => {
+    if (!file || !/^[\w.\-]+$/.test(file)) return bad(res, 400, 'bad file');
+    const full = path.join(LOG_DIR, file);
+    if (!fs.existsSync(full)) return bad(res, 404, 'not found');
+    const tail = Number(req.query.tail || 300000);
+    const tail = Number(req.query.tail || 200000);
+    let buf = await fsp.readFile(full, 'utf8');
+    if (buf.length > tail) buf = buf.slice(buf.length - tail);
+    res.type('text/plain').send(buf);
+@@ -223,41 +232,40 @@ app.post('/tasks/requeue', async (req, res) => {
+  ok(res);
 });
 
-// webhook — принимает любые имена аккаунтов
-app.post("/webhook/:account", async (req, res) => {
-  const account = req.params.account;
+// ===== WEBHOOK (ловим любые имена аккаунтов) =====
+const seenSystemToday = new Set(); // антидубль по (account:chat_id) для системного "Откликнулся"
+// ===== WEBHOOK: принимаем ЛЮБОЕ имя аккаунта =====
+// Правило:
+//  - если в одной строке есть "[Системное сообщение]" и "Кандидат откликнулся" → создать задачу
+//  - если НЕТ "[Системное сообщение]" → создать задачу
+//  - прочие системные → игнор
+const seenSystemToday = new Set(); // антидубль по account:chat_id для системного "отклик"
 
-  if (!checkSecret(req)) return res.status(403).json({ ok: false, error: "forbidden" });
+app.post('/webhook/:account', async (req, res) => {
+  const account = String(req.params.account || 'default');
 
-  const pretty = JSON.stringify(req.body || {}, null, 2);
-  appendLog(`=== RAW AVITO WEBHOOK (${account}) @ ${nowIso()} ===\n${pretty}\n=========================`);
+  // ЛОГИРУЕМ ВСЁ: заголовки + тело
+  // логируем вход
+  try {
+    const headTxt = JSON.stringify(req.headers || {}, null, 2);
+    const bodyTxt = JSON.stringify(req.body || {},   null, 2);
+    const head = `=== RAW AVITO WEBHOOK (${account}) @ ${nowIso()} ===\n-- HEADERS --\n${headTxt}\n-- BODY --\n${bodyTxt}\n=========================\n`;
+    await appendLog(head);
+    const blob = `=== RAW AVITO WEBHOOK (${account}) @ ${nowIso()} ===\n-- HEADERS --\n${headTxt}\n-- BODY --\n${bodyTxt}\n=========================\n`;
+    await appendLog(blob);
+  } catch {}
 
-  // сохраняем историю (кроме системных)
-  const val = req.body?.payload?.value;
-  if (val) {
-    try { await saveToHistory({ account, value: val }); } catch (e) { appendLog(`[HISTORY] error ${e}`); }
-  }
+  try {
+    const payload = req.body?.payload || {};
+    const val     = payload?.value || {};
+    const chatId  = val?.chat_id;
+    const msgId   = val?.id || null;
+    const itemId  = val?.item_id || null;
 
-  // Деловая логика постановки задач
-  // 1) Если строка содержит одновременно [Системное сообщение] и Кандидат откликнулся — создать один раз
-  // 2) Если не содержит [Системное сообщение] — это обычное сообщение — создавать задачу
-  let text = "";
-  if (typeof val?.content?.text === "string") text = val.content.text;
-  const isSystem = /\[Системное сообщение\]/i.test(text) || String(val?.type||"") === "system";
-  const isApply  = /Кандидат\s+откликнулся/i.test(text);
+    // Берём "сырую" строку текста как есть (на одной строке)
+    const textRaw = String(val?.content?.text || '').replace(/\r?\n/g, ' ');
+    // Признаки
+    const hasSystemTag   = textRaw.includes('[Системное сообщение]');
+    const hasCandidateKW = /кандидат\s+откликнулся/i.test(textRaw);
 
-  let shouldCreate = false;
-  if (isSystem && isApply) {
-    shouldCreate = true;
-    if (ONLY_FIRST_SYSTEM && redis && val?.chat_id) {
-      const onceKey = `sysOnce:${account}:${val.chat_id}`;
-      const was = await redis.get(onceKey);
-      if (was) shouldCreate = false; // уже ставили
-      else await redis.setEx(onceKey, 7*24*3600, "1"); // защитим от дублей на неделю
+    // Условия создания задач:
+    // 1) [Системное сообщение] И содержит "Кандидат откликнулся" → создаём (с антидублем)
+    // 2) НЕ содержит [Системное сообщение] → создаём (обычный текст от пользователя)
+    const isSystemCandidate = hasSystemTag && hasCandidateKW;
+    const isUserText        = !hasSystemTag; // любое не-системное — это сообщ. пользователя
+    const isUserText        = !hasSystemTag;
+
+    let shouldCreate = false;
+    if (isSystemCandidate) {
+      // антидубль на сессию
+      const key = `${account}:${chatId}`;
+      if (!seenSystemToday.has(key)) {
+        seenSystemToday.add(key);
+@@ -267,6 +275,22 @@ app.post('/webhook/:account', async (req, res) => {
+      shouldCreate = true;
     }
-  } else if (!isSystem) {
-    shouldCreate = true;
+
+    // (опц.) Сохраняем историю в Redis: всё кроме системных сообщений
+    if (redisClient && chatId && isUserText) {
+      const entry = {
+        ts: Date.now(),
+        author_id: val?.author_id ?? null,
+        type: val?.type || 'text',
+        text: String(val?.content?.text || ''),
+        item_id: itemId ?? null
+      };
+      // список на ключе history:<account>:<chat_id>
+      const key = `history:${account}:${chatId}`;
+      await redisClient.rPush(key, JSON.stringify(entry));
+      // держим максимум 200 сообщений
+      await redisClient.lTrim(key, -200, -1);
+    }
+
+    if (shouldCreate && chatId) {
+      await createTask({
+        account,
+@@ -275,23 +299,23 @@ app.post('/webhook/:account', async (req, res) => {
+        message_id: msgId
+      });
+    }
+
+  } catch (e) {
+    await appendLog(`[WEBHOOK ${account}] handler error: ${String(e)}`);
   }
 
-  if (shouldCreate && val?.chat_id) {
-    await createTask({
-      account,
-      chat_id: val.chat_id,
-      reply_text: DEFAULT_REPLY,
-      message_id: val.id || "",
-      item_id: val.item_id || ""
-    });
-  }
-
+  // Авито всегда ждёт 200
   res.json({ ok: true });
 });
 
-// ==== TASKS API ====
-
-// список файлов
-app.get("/tasks/debug", (req, res) => {
-  try {
-    ensureDir(TASK_DIR);
-    const files = fs.readdirSync(TASK_DIR).filter(f => f.endsWith(".json") || f.endsWith(".json.taking"));
-    res.json({ ok: true, files });
-  } catch (e) {
-    res.json({ ok: true, files: [] });
-  }
-});
-
-// чтение файла очереди/лока
-app.get("/tasks/read", (req, res) => {
-  try {
-    const name = String(req.query.file || "");
-    if (!name) return res.status(400).send("file required");
-    const p = path.join(TASK_DIR, name);
-    if (!fs.existsSync(p)) return res.status(404).json({ ok: false, error: "not found" });
-    const j = JSON.parse(fs.readFileSync(p, "utf8"));
-    res.json(j);
-  } catch (e) {
-    res.status(500).json({ ok: false, error: String(e) });
-  }
-});
-
-// claim
-app.get("/tasks/claim", (req, res) => {
-  const key = String(req.query.key || "");
-  const account = String(req.query.account || "");
-  if (key !== TASK_KEY) return res.status(403).json({ ok: false, error: "bad key" });
-
-  ensureDir(TASK_DIR);
-  const files = fs.readdirSync(TASK_DIR)
-    .filter(f => f.endsWith(".json") && !f.endsWith(".taking"))
-    .filter(f => !account || f.startsWith(`${account}__`))
-    .slice(0, CLAIM_SCAN_LIMIT)
-    .sort(); // детерминированность
-
-  if (!files.length) return res.json({ ok: true, has: false });
-
-  const file = files[0];
-  const lock = taskLockName(file);
-  const p = path.join(TASK_DIR, file);
-  const plock = path.join(TASK_DIR, lock);
-
-  try {
-    const obj = JSON.parse(fs.readFileSync(p, "utf8"));
-    // создаём lock
-    fs.writeFileSync(plock, fs.readFileSync(p));
-    // удаляем оригинал
-    fs.unlinkSync(p);
-
-    return res.json({
-      ok: true,
-      has: true,
-      lockId: lock,
-      ChatId: obj.chat_id || "",
-      ReplyText: obj.reply_text || DEFAULT_REPLY,
-      MessageId: obj.message_id || "",
-      Account: obj.account || ""
-    });
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: String(e) });
-  }
-});
-
-// done (без проверок логов) — просто удаляет lock
-app.post("/tasks/done", (req, res) => {
-  const key = String(req.query.key || "");
-  const lock = String(req.query.lock || "");
-  if (key !== TASK_KEY) return res.status(403).json({ ok: false, error: "bad key" });
-  if (!lock) return res.status(400).json({ ok: false, error: "no lock" });
-
-  const plock = path.join(TASK_DIR, lock);
-  if (fs.existsSync(plock)) fs.unlinkSync(plock);
-  return res.json({ ok: true });
-});
-
-// requeue — переводит .taking обратно в очередь
-app.post("/tasks/requeue", (req, res) => {
-  const key = String(req.query.key || "");
-  const lock = String(req.query.lock || "");
-  if (key !== TASK_KEY) return res.status(403).json({ ok: false, error: "bad key" });
-  if (!lock) return res.status(400).json({ ok: false, error: "no lock" });
-
-  const plock = path.join(TASK_DIR, lock);
-  if (!fs.existsSync(plock)) return res.json({ ok: true }); // уже нет — ок
-
-  try {
-    const data = fs.readFileSync(plock);
-    const base = lock.replace(/\.taking$/, "");
-    const p = path.join(TASK_DIR, base);
-    fs.writeFileSync(p, data);
-    fs.unlinkSync(plock);
-    return res.json({ ok: true });
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: String(e) });
-  }
-});
-
-// doneSafe — проверяет логи и только тогда закрывает
-app.post("/tasks/doneSafe", (req, res) => {
-  const key = String(req.query.key || "");
-  const lock = String(req.query.lock || "");
-  const chat = String(req.query.chat || "");
-  const author = String(req.query.author || "");
-
-  if (key !== TASK_KEY) return res.status(403).json({ ok: false, error: "bad key" });
-  if (!lock) return res.status(400).json({ ok: false, error: "no lock" });
-  if (!chat) return res.status(428).json({ ok: false, error: "no chat_id in lock" });
-
-  // проверяем последние 2 файла логов
-  try {
-    ensureDir(LOG_DIR);
-    const all = fs.readdirSync(LOG_DIR)
-      .filter(f => /^logs\.\d{4}-\d{2}-\d{2}\.log$/.test(f) || /^logs\.\d{8}\.log$/.test(f))
-      .sort()
-      .slice(-2);
-    const found = all.some(f => {
-      const s = fs.readFileSync(path.join(LOG_DIR, f), "utf8");
-      // ищем текстовые исходящие сообщения от нашего автора (author_id != 0)
-      return s.includes(`"chat_id": "${chat}"`) &&
-             /"type"\s*:\s*"text"/.test(s) &&
-             (author ? s.includes(`"author_id": ${author}`) : /"author_id":\s*(?!0)\d+/.test(s));
-    });
-
-    if (!found) {
-      return res.status(428).json({ ok: false, error: "not confirmed in logs", files: all });
-    }
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: String(e) });
-  }
-
-  // подтверждение найдено — удаляем lock
-  const plock = path.join(TASK_DIR, lock);
-  if (fs.existsSync(plock)) fs.unlinkSync(plock);
-  return res.status(204).end();
-});
-
-// ==== start ====
-app.listen(PORT, () => {
-  console.log(`✅ Webhook server on ${PORT}`);
-  console.log(`LOG_DIR=${LOG_DIR}, TASK_DIR=${TASK_DIR}, SECRET=${WEBHOOK_SECRET ? "[set]" : "[empty]"}`);
-});
+// ===== START =====
+(async () => {
+  await ensureDir(LOG_DIR);
+  await ensureDir(TASK_DIR);
+  console.log(`App root: ${path.resolve(__dirname)}`);
+  console.log(`LOG_DIR=${path.resolve(LOG_DIR)}`);
+  console.log(`TASK_DIR=${path.resolve(TASK_DIR)}`);
+  console.log(`TASK_KEY set: ${TASK_KEY ? 'yes' : 'no'}`);
+  console.log(`ONLY_FIRST_SYSTEM=${ONLY_FIRST_SYSTEM}`);
+  console.log(`CLAIM_WINDOW=${CLAIM_WINDOW}`);
+  app.listen(PORT, () => console.log(`Server on :${PORT}`));
+  console.log(`Redis: ${redisClient ? 'enabled' : 'disabled'}`);
+  const srv = app.listen(PORT, () => console.log(`Server on :${PORT}`));
+  srv.setTimeout(120000); // 120s safety
+})();

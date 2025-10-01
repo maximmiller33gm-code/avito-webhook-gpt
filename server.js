@@ -5,24 +5,21 @@ import crypto from "crypto";
 
 import { createClient } from "redis";
 
-// === Redis client (TLS support for rediss://) ===
-const parsed = new URL(process.env.REDIS_URL);
-const useTLS = parsed.protocol === "rediss:";
+// Универсальная инициализация: поддерживает и redis:// и rediss://
+const REDIS_URL = process.env.REDIS_URL || "";
+const parsed = new URL(REDIS_URL);
 
-const redis = createClient({
-  url: process.env.REDIS_URL,
-  socket: useTLS
-    ? {
-        tls: true,
-        servername: parsed.hostname,
-        rejectUnauthorized: false, // если сертификат не полный chain
-      }
-    : {},
-});
+// TLS включаем только если схема rediss://
+const socket =
+  parsed.protocol === "rediss:"
+    ? { tls: true, servername: parsed.hostname, rejectUnauthorized: false }
+    : undefined;
+
+const redis = createClient({ url: REDIS_URL, socket });
 
 redis.on("error", (err) => console.error("Redis Client Error", err));
 
-// подключаемся
+// ВАЖНО: дожидаемся коннекта до старта роутов
 await redis.connect();
 
 const app = express();

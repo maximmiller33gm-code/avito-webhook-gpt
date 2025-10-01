@@ -14,6 +14,21 @@ const TASK_KEY = process.env.TASK_KEY || "kK9f4JQ7uX2pL0aN";
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || "";  // если пусто — секрет не проверяем
 const MAX_CLAIM_SCAN = Number(process.env.CLAIM_SCAN_LIMIT || 50);
 
+// Включаем печать тела запроса в Deploy Logs по флагу
+const DEBUG_WEBHOOK = String(process.env.DEBUG_WEBHOOK || "").toLowerCase() === "true";
+
+// Утилита печати тела в Deploy Logs (ограничим размер)
+function logBodyToStdout(account, body) {
+  try {
+    const pretty = JSON.stringify(body ?? {}, null, 2);
+    const max = 4000; // чтобы не засорять логи
+    const cut = pretty.length > max ? pretty.slice(0, max) + "\n…(truncated)" : pretty;
+    console.log(`[WEBHOOK][${account}] RAW BODY @ ${new Date().toISOString()}\n${cut}`);
+  } catch (e) {
+    console.log(`[WEBHOOK][${account}] RAW BODY (string)\n${String(body).slice(0, 4000)}`);
+  }
+}
+
 // ensure dirs
 for (const p of [LOG_DIR, TASK_DIR]) {
   fs.mkdirSync(p, { recursive: true });
@@ -160,6 +175,10 @@ app.post("/tasks/done", async (req, res) => {
 // === WEBHOOK: принимает любые имена /webhook/:account ===
 app.post("/webhook/:account", async (req, res) => {
   const account = String(req.params.account || "").trim();
+
+  if (DEBUG_WEBHOOK) {
+  logBodyToStdout(account, req.body);
+}
 
   // 1) Секрет (если указан в ENV)
   const providedSecret = req.headers["x-avito-secret"];

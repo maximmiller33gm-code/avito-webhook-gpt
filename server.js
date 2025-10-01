@@ -5,12 +5,24 @@ import crypto from "crypto";
 
 import { createClient } from "redis";
 
-// === Redis client ===
-const redis = createClient({ url: process.env.REDIS_URL });
+// === Redis client (TLS support for rediss://) ===
+const parsed = new URL(process.env.REDIS_URL);
+const useTLS = parsed.protocol === "rediss:";
+
+const redis = createClient({
+  url: process.env.REDIS_URL,
+  socket: useTLS
+    ? {
+        tls: true,
+        servername: parsed.hostname,
+        rejectUnauthorized: false, // если сертификат не полный chain
+      }
+    : {},
+});
 
 redis.on("error", (err) => console.error("Redis Client Error", err));
 
-// подключаемся к Redis (async/await нужно обернуть в IIFE или сделать top-level await)
+// подключаемся
 await redis.connect();
 
 const app = express();

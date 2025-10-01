@@ -233,6 +233,18 @@ app.post("/webhook/:account", async (req, res) => {
   const isSystem = (val.type || "").toLowerCase() === "system" || txt.startsWith("[Системное сообщение]");
   const isApply = isSystem && /Кандидат\s+откликнулся/i.test(txt);
 
+  // Твой id аккаунта (или по-аккаунтно из карты)
+const MY_ACCOUNT_ID = String(process.env.ACCOUNT_ID || process.env.ACCOUNTID || "");
+// Доп. список id, которые считаем "свои" (через запятую), если нужно
+const BLOCK_AUTHOR_IDS = (process.env.BLOCK_AUTHOR_IDS || "")
+  .split(",").map(s => s.trim()).filter(Boolean);
+
+// Это наше исходящее? (авито шлёт и входящие, и исходящие)
+const isFromMe = (authorId && MY_ACCOUNT_ID && authorId === MY_ACCOUNT_ID) 
+  || BLOCK_AUTHOR_IDS.includes(authorId)
+  || authorId === "0"   // системный бот Avito (иногда 0/1)
+  || authorId === "1";  // системный
+  
 // === 3.5 Сохраняем событие в историю (кроме системных) ===
 const limit = Number(process.env.HISTORY_LIMIT || 100);
 const ttl   = Number(process.env.HISTORY_TTL_SEC || 259200);
@@ -252,6 +264,13 @@ if (chatId && msgId && txt && !txt.includes("[Системное сообщен�
   await redis.lPush(key, JSON.stringify(entry));
   await redis.lTrim(key, 0, limit - 1);
   await redis.expire(key, ttl);
+}
+  // 3.5 Сохранили событие в историю (включая мои сообщения)
+
+// 3.6 Если сообщение от моего аккаунта — задачи не создаём
+if (isFromMe) {
+  await appendLog(`[TASK] skipped for ${account} chat=${chatId} reason=from-me author=${authorId}`);
+  return res.json({ ok: true });
 }
 
   // 4) Правило создания задач:

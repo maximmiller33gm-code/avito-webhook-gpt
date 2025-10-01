@@ -161,10 +161,6 @@ app.post("/tasks/done", async (req, res) => {
 app.post("/webhook/:account", async (req, res) => {
   const account = String(req.params.account || "").trim();
 
-  // Логируем тело запроса, если включен DEBUG_WEBHOOK
-  if (DEBUG_WEBHOOK) {
-    logBodyToStdout(account, req.body);
-
   // 1) Секрет (если указан в ENV)
   const providedSecret = req.headers["x-avito-secret"];
   // if (WEBHOOK_SECRET) {

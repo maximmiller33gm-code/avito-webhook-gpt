@@ -23,7 +23,39 @@ redis.on("error", (err) => console.error("Redis Client Error", err));
 await redis.connect();
 
 const app = express();
-app.use(express.json({ limit: "1mb" }));
+// --- JSON-парсер (ставим ДО роутов/логгера)
+app.use(express.json({
+  limit: "1mb",
+  // на случай если провайдер шлет JSON как text/plain
+  type: ["application/json", "application/*+json", "text/plain"]
+}));
+
+// --- Гарантированный лог-хук для всех вебхуков (в stdout/Deploy Logs)
+// ОБЯЗАТЕЛЬНО стоит ДО app.post("/webhook/:account", ...)
+app.use("/webhook/:account", (req, res, next) => {
+  try {
+    const account = String(req.params.account || "");
+    const now = new Date().toISOString();
+    console.log(`[WEBHOOK][${account}] HIT @ ${now}`);
+    console.log(`[WEBHOOK][${account}] HEADERS: ${JSON.stringify(req.headers, null, 2)}`);
+
+    if (req.body && Object.keys(req.body).length) {
+      console.log(`[WEBHOOK][${account}] BODY: ${JSON.stringify(req.body, null, 2)}`);
+    } else {
+      // Если по какой-то причине не распарсилось — выведем сырое тело
+      let raw = "";
+      req.setEncoding("utf8");
+      req.on("data", chunk => raw += chunk);
+      req.on("end", () => {
+        if (raw) console.log(`[WEBHOOK][${account}] RAW: ${raw}`);
+      });
+    }
+  } catch (e) {
+    console.error("[WEBHOOK] logger error:", e);
+  } finally {
+    next();
+  }
+});
 
 // === ENV & paths ===
 const PORT = Number(process.env.PORT || 8080);

@@ -209,98 +209,75 @@ app.post("/tasks/done", async (req, res) => {
 app.post("/webhook/:account", async (req, res) => {
   const account = String(req.params.account || "").trim();
 
-  if (DEBUG_WEBHOOK) {
-  logBodyToStdout(account, req.body);
-}
+  // 1) Парсим полезное
+  const val      = req.body?.payload?.value || {};
+  const chatId   = val.chat_id || val.chatId || "";
+  const msgId    = val.id || val.message_id || "";
+  const txt      = (val.content?.text || "").trim();
+  const vType    = (val.type || "").toLowerCase();
+  const isSystem = vType === "system" || txt.startsWith("[Системное сообщение]");
+  const isApply  = isSystem && /Кандидат\s+откликнулся/i.test(txt);
+  const authorId = String(val.author_id || "");
 
-  // 1) Секрет (если указан в ENV)
-  const providedSecret = req.headers["x-avito-secret"];
-  // if (WEBHOOK_SECRET) {
-//   if (!providedSecret || String(providedSecret) !== String(WEBHOOK_SECRET)) {
-//     return res.status(403).json({ ok: false, error: "forbidden" });
-//   }
-// }
+  // 2) Пишем ИСТОРИЮ (только НЕ системные)
+  try {
+    if (chatId && msgId && txt && !txt.includes("[Системное сообщение]")) {
+      const entry = {
+        chat_id:   chatId,
+        ts:        val.created,
+        type:      val.type,
+        text:      txt,
+        item_id:   val.item_id,
+        message_id: msgId,
+        author_id: authorId,
+      };
+      const key   = `chat:${account}:${chatId}`;
+      const limit = Number(process.env.HISTORY_LIMIT || 100);
+      const ttl   = Number(process.env.HISTORY_TTL_SEC || 259200);
+      await redis.lPush(key, JSON.stringify(entry));
+      await redis.lTrim(key, 0, limit - 1);
+      await redis.expire(key, ttl);
+    }
+  } catch (e) {
+    console.error("history save error:", e?.message || e);
+  }
 
-  // 2) Логируем «сырое» тело
-  const pretty = JSON.stringify(req.body || {}, null, 2);
-  await appendLog(`=== RAW AVITO WEBHOOK (${account}) @ ${nowIso()} ===\n${pretty}\n=========================`);
+  // 3) Фильтр: создавать ли ЗАДАЧУ
+  const MY_ID = String(process.env.ACCOUNT_ID || process.env.ACCOUNTID || "").trim();
+  const BLOCK_AUTHOR_IDS = (process.env.BLOCK_AUTHOR_IDS || "")
+    .split(",").map(s => s.trim()).filter(Boolean);
 
-  // 3) Пытаемся вытащить полезное
-  const val = req.body?.payload?.value || {};
-  const chatId = val.chat_id || val.chatId || "";
-  const msgId = val.id || val.message_id || "";
-  const txt = (val.content?.text || "").trim();
-  const isSystem = (val.type || "").toLowerCase() === "system" || txt.startsWith("[Системное сообщение]");
-  const isApply = isSystem && /Кандидат\s+откликнулся/i.test(txt);
-  const authorId = val.author_id || "";
+  const isFromMe =
+       (authorId && MY_ID && authorId === MY_ID)
+    || BLOCK_AUTHOR_IDS.includes(authorId)
+    || authorId === "0"   // системный Авито
+    || authorId === "1";  // системный
 
-  // Твой id аккаунта (или по-аккаунтно из карты)
-const MY_ACCOUNT_ID = String(process.env.ACCOUNT_ID || process.env.ACCOUNTID || "");
-// Доп. список id, которые считаем "свои" (через запятую), если нужно
-const BLOCK_AUTHOR_IDS = (process.env.BLOCK_AUTHOR_IDS || "")
-  .split(",").map(s => s.trim()).filter(Boolean);
+  // правило: создаём задачу только если
+  //   — системное «Кандидат откликнулся…», ИЛИ
+  //   — обычный текст от кандидата (не системное, есть текст, автор не наш)
+  const shouldCreate =
+       isApply
+    || (!isSystem && txt && !isFromMe);
 
-// Это наше исходящее? (авито шлёт и входящие, и исходящие)
-const isFromMe = (authorId && MY_ACCOUNT_ID && authorId === MY_ACCOUNT_ID) 
-  || BLOCK_AUTHOR_IDS.includes(authorId)
-  || authorId === "0"   // системный бот Avito (иногда 0/1)
-  || authorId === "1";  // системный
-  
-// === 3.5 Сохраняем событие в историю (кроме системных) ===
-const limit = Number(process.env.HISTORY_LIMIT || 100);
-const ttl   = Number(process.env.HISTORY_TTL_SEC || 259200);
+  if (!shouldCreate || !chatId) {
+    const reason = isSystem
+      ? (isApply ? "should-not-happen" : "system-non-apply")
+      : (isFromMe ? "from-me" : "no-text");
+    await appendLog(`[TASK] skipped for ${account} chat=${chatId} reason=${reason}`);
+    return res.json({ ok: true });
+  }
 
-if (chatId && msgId && txt && !txt.includes("[Системное сообщение]")) {
-  const entry = {
-    chat_id:    chatId,
-    ts:         val.created,
-    type:       val.type,
-    text:       txt,
-    item_id:    val.item_id,
-    message_id: msgId,
-    author_id:  val.author_id,
-  };
-
-  const key = `chat:${account}:${chatId}`;
-  await redis.lPush(key, JSON.stringify(entry));
-  await redis.lTrim(key, 0, limit - 1);
-  await redis.expire(key, ttl);
-}
-  // 3.5 Сохранили событие в историю (включая мои сообщения)
-
-// 3.6 Если сообщение от моего аккаунта — задачи не создаём
-if (isFromMe) {
-  await appendLog(`[TASK] skipped for ${account} chat=${chatId} reason=from-me author=${authorId}`);
-  return res.json({ ok: true });
-}
-
-  // 4) Правило создания задач:
-  //    - если системное и «Кандидат откликнулся…» → создать
-  //    - если не системное (обычный текст) → создать
-  //    - все остальные системные — игнор
-  let shouldCreate = false;
-  if (isApply) shouldCreate = true;
-  else if (!isSystem && txt) shouldCreate = true;
-
-  if (shouldCreate && chatId) {
-  // Берём текст из сообщения, а не дефолт
-  // - если обычный текст → пишем его
-  // - если системный отклик → оставляем пусто (или поставь свою фразу)
-  // - если вообще нет текста → тоже пусто
- const replyText = txt ? String(txt) : "";
-
+  // 4) Создаём задачу
+  const replyText = !isSystem ? String(txt) : ""; // для системного отклика — пусто
   await writeTask({
     account,
-    chat_id: chatId,
-    reply_text: replyText,   // <-- здесь теперь реальный текст/пусто
+    chat_id:    chatId,
+    reply_text: replyText,
     message_id: msgId,
     created_at: nowIso(),
   });
-
-  await appendLog(`[TASK] created for ${account} chat=${chatId} msg=${msgId} reply="${replyText.slice(0,80)}"`);
-} else {
-  await appendLog(`[TASK] skipped for ${account} chat=${chatId} reason=${isSystem ? "system-non-apply" : "no-text"}`);
-}
+  await appendLog(`[TASK] created for ${account} chat=${chatId} msg=${msgId}`);
 
   res.json({ ok: true });
 });

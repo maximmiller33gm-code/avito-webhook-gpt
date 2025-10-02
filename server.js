@@ -192,8 +192,7 @@ app.get("/tasks/claim", async (req, res) => {
         ChatId: task.chat_id || "",
         ReplyText: task.reply_text || "",
         MessageId: task.message_id || "",
-        Account: task.account || ""
-        type_webhook: task.type_webhook || ""  
+        Account: task.account || "" 
       });
     } catch {
       // файл могли схватить параллельно — пробуем дальше

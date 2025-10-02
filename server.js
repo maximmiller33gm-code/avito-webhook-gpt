@@ -301,15 +301,25 @@ app.post("/webhook/:account", async (req, res) => {
   }
 
   // 4) Создаём задачу
-  const replyText = !isSystem ? String(txt) : ""; // для системного отклика — пусто
-  await writeTask({
-    account,
-    chat_id:    chatId,
-    reply_text: replyText,
-    message_id: msgId,
-    created_at: nowIso(),
-  });
-  await appendLog(`[TASK] created for ${account} chat=${chatId} msg=${msgId}`);
+
+// Определяем тип вебхука
+let typeWebhook = "сообщение";
+if (isSystem && txt.includes("Кандидат откликнулся")) {
+  typeWebhook = "отклик";
+}
+
+const replyText = isSystem ? "" : String(txt || ""); // для системного отклика — пусто
+
+await writeTask({
+  account,
+  chat_id: chatId,
+  reply_text: replyText,
+  message_id: msgId,
+  created_at: nowIso(),
+  type_webhook: typeWebhook   // <--- добавили поле
+});
+
+await appendLog(`[TASK] created for ${account} chat=${chatId} msg=${msgId} type=${typeWebhook}`);
 
   res.json({ ok: true });
 });
